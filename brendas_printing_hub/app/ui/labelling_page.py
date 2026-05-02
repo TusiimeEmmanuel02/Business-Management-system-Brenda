@@ -1,449 +1,661 @@
-"""Labelling jobs page with installment payment tracking."""
+"""
+Labelling Jobs page.
+
+Tracks clothing-labelling orders (jersey, shirt, school uniform, ...) with
+installment payments. Each payment is mirrored to a Sale row in the
+Labelling category so it flows into dashboards and cash reports.
+"""
 from __future__ import annotations
-from decimal import Decimal
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor
+
+from datetime import date, datetime, timedelta
+from typing import List, Optional
+
+from PySide6.QtCore import Qt, QDate, QDateTime
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit,
-    QComboBox, QTableWidgetItem, QMessageBox, QFrame, QSpinBox,
-    QDialog, QDialogButtonBox, QFormLayout, QDoubleSpinBox, QTextEdit
+    QComboBox,
+    QDateEdit,
+    QDialog,
+    QDialogButtonBox,
+    QDoubleSpinBox,
+    QFormLayout,
+    QFrame,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QLineEdit,
+    QPushButton,
+    QSpinBox,
+    QTableWidget,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
 )
 
-from app.core.auth import has_permission, AuthError
-from app.core.utils import format_money, format_datetime
-from app.database.models import JobStatus, PaymentMethod
-from app.database.session import session_scope
-from app.services.labelling_service import LabellingService, LabellingError
-from app.ui.components.cards import KpiCard
-from app.ui.components.tables import StyledTable, set_column_widths
-from app.ui.components.dialogs import ConfirmDialog
+from app.core.auth import current_user
+from app.core.constants import (
+    AUDIT_CREATE,
+    AUDIT_DELETE,
+    AUDIT_UPDATE,
+    JOB_STATUSES,
+    JOB_STATUS_CANCELLED,
+    JOB_STATUS_COLLECTED,
+    JOB_STATUS_COMPLETED,
+    JOB_STATUS_IN_PROGRESS,
+    JOB_STATUS_PENDING,
+    LABELLING_ITEM_TYPES,
+    PAYMENT_CASH,
+    PAYMENT_METHODS,
+    PAY_STATUSES,
+    ROLE_ADMIN,
+)
+from app.core.utils import (
+    format_date,
+    format_datetime,
+    format_money,
+    parse_money,
+)
+from app.services import labelling_service
+from app.services.audit_service import log_action
+from app.ui.components.cards import Panel, StatCard, StatusBadge
+from app.ui.components.dialogs import confirm, error, info, toast
+from app.ui.components.tables import configure_table, make_item, make_money_item
 
 
-PAYMENT_METHODS = [m.value for m in PaymentMethod]
-JOB_STATUSES = ["All"] + [s.value for s in JobStatus]
+PAYMENT_STATE_MAP = {
+    "Unpaid": "danger",
+    "Partially Paid": "warning",
+    "Fully Paid": "success",
+}
 
+JOB_STATE_MAP = {
+    JOB_STATUS_PENDING: "warning",
+    JOB_STATUS_IN_PROGRESS: "info",
+    JOB_STATUS_COMPLETED: "success",
+    JOB_STATUS_COLLECTED: "muted",
+    JOB_STATUS_CANCELLED: "muted",
+}
+
+
+# ---------------------------------------------------------------------------
+# New / Edit job dialog
+# ---------------------------------------------------------------------------
 
 class JobDialog(QDialog):
-    """Create or edit a labelling job."""
-
-    def __init__(self, parent=None, job=None):
+    def __init__(self, parent: QWidget | None = None,
+                 job: labelling_service.JobSummary | None = None) -> None:
         super().__init__(parent)
-        self.job = job
-        self.setWindowTitle("Edit Job" if job else "New Labelling Job")
-        self.setMinimumWidth(480)
-        self.setObjectName("DialogWindow")
+        self.setWindowTitle("Edit Labelling Job" if job else "New Labelling Job")
+        self.setModal(True)
+        self.resize(480, 0)
+        self._job = job
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 24, 24, 24)
-        layout.setSpacing(16)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(10)
 
-        title = QLabel("Edit Labelling Job" if job else "New Labelling Job")
-        title.setObjectName("DialogTitle")
+        title = QLabel("Edit labelling job" if job else "Create new labelling job")
+        title.setStyleSheet("font-size:16px; font-weight:700; color:#0F172A;")
         layout.addWidget(title)
+        sub = QLabel("Capture customer details, item, quantity, price, and (optionally) a deposit.")
+        sub.setStyleSheet("color:#64748B; font-size:12px;")
+        layout.addWidget(sub)
 
         form = QFormLayout()
-        form.setSpacing(10)
+        form.setSpacing(8)
 
         self.customer_input = QLineEdit(job.customer_name if job else "")
-        form.addRow("Customer *", self.customer_input)
+        self.phone_input = QLineEdit(job.customer_phone if job else "")
+        self.phone_input.setPlaceholderText("Optional")
 
-        self.product_input = QTextEdit(job.product_description if job else "")
-        self.product_input.setMaximumHeight(70)
-        form.addRow("Product / Description *", self.product_input)
+        self.item_combo = QComboBox()
+        self.item_combo.addItems(LABELLING_ITEM_TYPES)
+        if job:
+            idx = self.item_combo.findText(job.item_type)
+            if idx >= 0:
+                self.item_combo.setCurrentIndex(idx)
+
+        self.description_input = QLineEdit(job.description if job else "")
+        self.description_input.setPlaceholderText("e.g. School name, colours, sizes")
 
         self.qty_input = QSpinBox()
-        self.qty_input.setMinimum(1)
-        self.qty_input.setMaximum(100_000)
-        self.qty_input.setValue(job.quantity if job else 1)
-        form.addRow("Quantity", self.qty_input)
+        self.qty_input.setRange(1, 100_000)
+        self.qty_input.setValue(int(job.quantity) if job else 1)
 
-        self.total_input = QDoubleSpinBox()
-        self.total_input.setMaximum(10_000_000)
-        self.total_input.setDecimals(2)
-        self.total_input.setPrefix("$ ")
-        self.total_input.setValue(float(job.total_amount) if job else 0)
-        form.addRow("Total Amount *", self.total_input)
+        self.price_input = QLineEdit()
+        self.price_input.setPlaceholderText("e.g. 5,000")
+        if job:
+            self.price_input.setText(format_money(job.unit_price, with_symbol=False))
 
-        if not job:
-            self.deposit_input = QDoubleSpinBox()
-            self.deposit_input.setMaximum(10_000_000)
-            self.deposit_input.setDecimals(2)
-            self.deposit_input.setPrefix("$ ")
-            form.addRow("Deposit (optional)", self.deposit_input)
+        self.due_input = QDateEdit()
+        self.due_input.setCalendarPopup(True)
+        self.due_input.setDisplayFormat("dd MMM yyyy")
+        if job and job.due_date:
+            self.due_input.setDate(QDate(job.due_date.year, job.due_date.month, job.due_date.day))
+        else:
+            self.due_input.setDate(QDate.currentDate().addDays(3))
 
+        # Deposit (only on create)
+        self.deposit_input: Optional[QLineEdit] = None
+        self.deposit_method_combo: Optional[QComboBox] = None
+        if job is None:
+            self.deposit_input = QLineEdit()
+            self.deposit_input.setPlaceholderText("Optional, e.g. 10,000")
             self.deposit_method_combo = QComboBox()
             self.deposit_method_combo.addItems(PAYMENT_METHODS)
-            form.addRow("Deposit Method", self.deposit_method_combo)
-        else:
-            self.deposit_input = None
-            self.deposit_method_combo = None
+            self.deposit_method_combo.setCurrentText(PAYMENT_CASH)
 
-        self.notes_input = QTextEdit(job.notes if job else "")
-        self.notes_input.setMaximumHeight(80)
+        self.notes_input = QTextEdit()
+        self.notes_input.setMaximumHeight(70)
+        if job:
+            self.notes_input.setPlainText(job.notes)
+
+        form.addRow("Customer name *", self.customer_input)
+        form.addRow("Customer phone", self.phone_input)
+        form.addRow("Item type", self.item_combo)
+        form.addRow("Description", self.description_input)
+        form.addRow("Quantity", self.qty_input)
+        form.addRow("Unit price (UGX)", self.price_input)
+        form.addRow("Due date", self.due_input)
+        if self.deposit_input is not None:
+            form.addRow("Deposit (UGX)", self.deposit_input)
+            form.addRow("Deposit method", self.deposit_method_combo)
         form.addRow("Notes", self.notes_input)
-
         layout.addLayout(form)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
+        # Live total preview
+        self.total_label = QLabel("Total: UGX 0")
+        self.total_label.setStyleSheet("font-size:14px; font-weight:700; color:#0F172A;")
+        layout.addWidget(self.total_label)
+
+        self.qty_input.valueChanged.connect(self._update_total)
+        self.price_input.textChanged.connect(self._update_total)
+        self._update_total()
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
-    def get_data(self):
-        return {
-            "customer_name": self.customer_input.text().strip(),
-            "product_description": self.product_input.toPlainText().strip(),
-            "quantity": self.qty_input.value(),
-            "total_amount": Decimal(str(self.total_input.value())),
-            "notes": self.notes_input.toPlainText().strip(),
-            "deposit": (
-                Decimal(str(self.deposit_input.value()))
-                if self.deposit_input is not None else Decimal("0")
-            ),
-            "deposit_method": (
-                self.deposit_method_combo.currentText()
-                if self.deposit_method_combo is not None else PaymentMethod.CASH.value
-            ),
-        }
+    def _update_total(self, *_) -> None:
+        qty = self.qty_input.value()
+        price = parse_money(self.price_input.text())
+        total = qty * price
+        self.total_label.setText(f"Total: {format_money(total)}")
 
+    def _accept(self) -> None:
+        name = self.customer_input.text().strip()
+        if not name:
+            error(self, "Missing customer", "Please enter the customer name.")
+            return
+        unit_price = parse_money(self.price_input.text())
+        if unit_price <= 0:
+            error(self, "Invalid price", "Unit price must be greater than 0.")
+            return
+        qty = self.qty_input.value()
+        item_type = self.item_combo.currentText()
+        description = self.description_input.text().strip()
+        phone = self.phone_input.text().strip()
+        notes = self.notes_input.toPlainText().strip()
+        due_qd = self.due_input.date()
+        due_date = date(due_qd.year(), due_qd.month(), due_qd.day())
+
+        cu = current_user()
+        try:
+            if self._job is None:
+                deposit = parse_money(self.deposit_input.text()) if self.deposit_input else 0
+                deposit_method = (
+                    self.deposit_method_combo.currentText()
+                    if self.deposit_method_combo else PAYMENT_CASH
+                )
+                new_id = labelling_service.create_job(
+                    customer_name=name,
+                    customer_phone=phone,
+                    item_type=item_type,
+                    description=description,
+                    quantity=qty,
+                    unit_price=float(unit_price),
+                    due_date=due_date,
+                    deposit=float(deposit),
+                    deposit_method=deposit_method,
+                    notes=notes,
+                    created_by=cu.id if cu else None,
+                )
+                log_action(
+                    AUDIT_CREATE,
+                    module="labelling",
+                    description=(
+                        f"Created labelling job #{new_id} for {name} - "
+                        f"{format_money(qty * unit_price)}"
+                    ),
+                )
+            else:
+                labelling_service.update_job(
+                    self._job.id,
+                    customer_name=name,
+                    customer_phone=phone,
+                    item_type=item_type,
+                    description=description,
+                    quantity=qty,
+                    unit_price=float(unit_price),
+                    due_date=due_date,
+                    notes=notes,
+                )
+                log_action(
+                    AUDIT_UPDATE,
+                    module="labelling",
+                    description=f"Updated labelling job #{self._job.id} ({name})",
+                )
+        except labelling_service.LabellingError as exc:
+            error(self, "Could not save job", str(exc))
+            return
+        self.accept()
+
+
+# ---------------------------------------------------------------------------
+# Payment dialog
+# ---------------------------------------------------------------------------
 
 class PaymentDialog(QDialog):
-    """Record an installment payment."""
-
-    def __init__(self, parent=None, job=None):
+    def __init__(self, parent: QWidget, job: labelling_service.JobSummary) -> None:
         super().__init__(parent)
-        self.job = job
-        self.setWindowTitle("Add Payment")
-        self.setMinimumWidth(420)
-        self.setObjectName("DialogWindow")
+        self.setWindowTitle("Record Payment")
+        self.setModal(True)
+        self.resize(420, 0)
+        self._job = job
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 24, 24, 24)
-        layout.setSpacing(16)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(10)
 
-        title = QLabel("Record Payment")
-        title.setObjectName("DialogTitle")
+        title = QLabel("Record payment")
+        title.setStyleSheet("font-size:16px; font-weight:700; color:#0F172A;")
         layout.addWidget(title)
 
-        info = QLabel(
-            f"Customer: <b>{job.customer_name}</b><br>"
-            f"Total: {format_money(job.total_amount)}<br>"
-            f"Paid: {format_money(job.paid_amount)}<br>"
-            f"Balance due: <b style='color:#dc2626'>{format_money(job.balance_amount)}</b>"
-        )
-        info.setObjectName("DialogSubtitle")
-        layout.addWidget(info)
+        recap = QFrame()
+        recap.setObjectName("Panel")
+        rec_layout = QVBoxLayout(recap)
+        rec_layout.setContentsMargins(14, 12, 14, 12)
+        rec_layout.setSpacing(4)
+        for label, value in [
+            ("Customer", job.customer_name),
+            ("Item", f"{job.quantity}\u00d7 {job.item_type}"),
+            ("Total", format_money(job.total_amount)),
+            ("Already paid", format_money(job.amount_paid)),
+            ("Balance", format_money(job.balance)),
+        ]:
+            row = QHBoxLayout()
+            l1 = QLabel(label)
+            l1.setStyleSheet("color:#475569;")
+            l2 = QLabel(value)
+            l2.setStyleSheet("color:#0F172A; font-weight:600;")
+            l2.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            row.addWidget(l1)
+            row.addStretch(1)
+            row.addWidget(l2)
+            rec_layout.addLayout(row)
+        layout.addWidget(recap)
 
         form = QFormLayout()
-        form.setSpacing(10)
+        form.setSpacing(8)
 
-        self.amount_input = QDoubleSpinBox()
-        self.amount_input.setMaximum(float(job.balance_amount))
-        self.amount_input.setDecimals(2)
-        self.amount_input.setPrefix("$ ")
-        self.amount_input.setValue(float(job.balance_amount))
-        form.addRow("Payment Amount *", self.amount_input)
-
+        self.amount_input = QLineEdit()
+        self.amount_input.setPlaceholderText(f"max {format_money(job.balance, with_symbol=False)}")
+        self.amount_input.setText(format_money(job.balance, with_symbol=False))
         self.method_combo = QComboBox()
         self.method_combo.addItems(PAYMENT_METHODS)
-        form.addRow("Method", self.method_combo)
-
+        self.method_combo.setCurrentText(PAYMENT_CASH)
         self.notes_input = QLineEdit()
-        form.addRow("Notes", self.notes_input)
+        self.notes_input.setPlaceholderText("Notes (optional)")
 
+        form.addRow("Amount (UGX)", self.amount_input)
+        form.addRow("Method", self.method_combo)
+        form.addRow("Notes", self.notes_input)
         layout.addLayout(form)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
-    def get_data(self):
-        return {
-            "amount": Decimal(str(self.amount_input.value())),
-            "method": self.method_combo.currentText(),
-            "notes": self.notes_input.text().strip(),
-        }
+    def _accept(self) -> None:
+        amount = parse_money(self.amount_input.text())
+        if amount <= 0:
+            error(self, "Invalid amount", "Please enter an amount greater than 0.")
+            return
+        if amount > self._job.balance + 0.01:
+            error(self, "Too much", f"Amount cannot exceed the balance of {format_money(self._job.balance)}.")
+            return
+        cu = current_user()
+        try:
+            labelling_service.add_payment(
+                self._job.id,
+                amount=float(amount),
+                payment_method=self.method_combo.currentText(),
+                notes=self.notes_input.text().strip(),
+                user_id=cu.id if cu else None,
+            )
+            log_action(
+                AUDIT_CREATE,
+                module="labelling",
+                description=(
+                    f"Recorded payment {format_money(amount)} for job #{self._job.id} "
+                    f"({self._job.customer_name})"
+                ),
+            )
+        except labelling_service.LabellingError as exc:
+            error(self, "Could not record payment", str(exc))
+            return
+        self.accept()
+
+
+# ---------------------------------------------------------------------------
+# Page
+# ---------------------------------------------------------------------------
+
+STATUS_FILTERS = ("All",) + JOB_STATUSES + ("Has balance",)
 
 
 class LabellingPage(QWidget):
-    def __init__(self, parent=None):
+    def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setObjectName("Page")
+        self._rows: List[labelling_service.JobSummary] = []
         self._build_ui()
         self.refresh()
 
-    def _build_ui(self):
-        root = QVBoxLayout(self)
-        root.setContentsMargins(24, 24, 24, 24)
-        root.setSpacing(20)
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(28, 24, 28, 28)
+        layout.setSpacing(14)
 
         # Header
-        header = QHBoxLayout()
+        head = QHBoxLayout()
+        col = QVBoxLayout()
+        col.setSpacing(2)
         title = QLabel("Labelling Jobs")
-        title.setObjectName("PageTitle")
-        subtitle = QLabel("Track product labelling orders & installment payments")
-        subtitle.setObjectName("PageSubtitle")
-        title_box = QVBoxLayout()
-        title_box.setSpacing(2)
-        title_box.addWidget(title)
-        title_box.addWidget(subtitle)
-        header.addLayout(title_box)
-        header.addStretch()
+        title.setStyleSheet("font-size:22px; font-weight:700; color:#0F172A;")
+        sub = QLabel("Track jersey, shirt, school uniform and clothing labelling orders.")
+        sub.setStyleSheet("color:#64748B;")
+        col.addWidget(title)
+        col.addWidget(sub)
+        head.addLayout(col)
+        head.addStretch(1)
 
-        if has_permission("labelling.create"):
-            new_btn = QPushButton("+ New Job")
-            new_btn.setObjectName("PrimaryButton")
-            new_btn.setMinimumHeight(38)
-            new_btn.clicked.connect(self._on_new_job)
-            header.addWidget(new_btn)
-        root.addLayout(header)
+        self._add_btn = QPushButton("  + New Job")
+        self._add_btn.setObjectName("PrimaryButton")
+        self._add_btn.setCursor(Qt.PointingHandCursor)
+        self._add_btn.clicked.connect(self._on_add)
+        head.addWidget(self._add_btn)
+        layout.addLayout(head)
 
-        # KPIs
+        # KPI cards
         cards = QHBoxLayout()
-        cards.setSpacing(16)
-        self.card_pending = KpiCard("Pending Jobs", "0", subtitle="Awaiting work")
-        self.card_inprogress = KpiCard("In Progress", "0", subtitle="Partially paid")
-        self.card_outstanding = KpiCard("Outstanding", "$0.00", subtitle="Total balance due")
-        self.card_today_pay = KpiCard("Today's Payments", "$0.00", subtitle="All methods")
-        for c in (self.card_pending, self.card_inprogress, self.card_outstanding, self.card_today_pay):
-            cards.addWidget(c, 1)
-        root.addLayout(cards)
+        cards.setSpacing(12)
+        self._card_pending = StatCard("Pending", accent="#D97706")
+        self._card_progress = StatCard("In progress", accent="#0EA5E9")
+        self._card_outstanding = StatCard("Outstanding balance", accent="#DC2626")
+        self._card_today_pay = StatCard("Today's payments", accent="#16A34A")
+        for c in (self._card_pending, self._card_progress, self._card_outstanding, self._card_today_pay):
+            cards.addWidget(c)
+        layout.addLayout(cards)
 
         # Filters
-        filters = QFrame()
-        filters.setObjectName("Card")
-        f_layout = QHBoxLayout(filters)
-        f_layout.setContentsMargins(16, 12, 16, 12)
-        f_layout.setSpacing(12)
-
-        f_layout.addWidget(QLabel("Search:"))
-        self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("Customer or product...")
-        self.search_input.setMinimumWidth(220)
-        self.search_input.textChanged.connect(self.refresh)
-        f_layout.addWidget(self.search_input)
-
-        f_layout.addWidget(QLabel("Status:"))
-        self.status_combo = QComboBox()
-        self.status_combo.addItems(JOB_STATUSES)
-        self.status_combo.currentIndexChanged.connect(self.refresh)
-        f_layout.addWidget(self.status_combo)
-
-        f_layout.addStretch()
-        refresh_btn = QPushButton("Refresh")
-        refresh_btn.clicked.connect(self.refresh)
-        f_layout.addWidget(refresh_btn)
-        root.addWidget(filters)
+        filt = Panel(title="Filters")
+        bar = QHBoxLayout()
+        bar.setSpacing(8)
+        self._status_combo = QComboBox()
+        self._status_combo.addItems(STATUS_FILTERS)
+        self._status_combo.currentTextChanged.connect(self.refresh)
+        self._search_input = QLineEdit()
+        self._search_input.setPlaceholderText("Search customer name / phone / description")
+        self._search_input.setClearButtonEnabled(True)
+        self._search_input.textChanged.connect(self.refresh)
+        bar.addWidget(QLabel("Status:"))
+        bar.addWidget(self._status_combo)
+        bar.addWidget(self._search_input, stretch=1)
+        filt.add_layout(bar)
+        layout.addWidget(filt)
 
         # Table
-        self.table = StyledTable([
-            "Date", "Customer", "Product", "Qty", "Total", "Paid", "Balance", "Status"
-        ])
-        self.table.cellDoubleClicked.connect(self._on_view_job)
+        panel = Panel(title="Jobs")
+        self.table = QTableWidget()
+        configure_table(
+            self.table,
+            ["Date", "Customer", "Item", "Qty", "Total", "Paid", "Balance",
+             "Pay status", "Job status", "Due"],
+            stretch_last=False,
+            resize_modes={i: QHeaderView.ResizeToContents for i in range(10)},
+        )
+        self.table.itemSelectionChanged.connect(self._update_actions)
+        self.table.cellDoubleClicked.connect(lambda *_: self._on_view())
+        panel.add_widget(self.table)
 
-        # Action buttons row
-        actions_row = QHBoxLayout()
-        actions_row.addStretch()
-        self.payment_btn = QPushButton("Add Payment")
-        self.payment_btn.setObjectName("PrimaryButton")
-        self.payment_btn.clicked.connect(self._on_add_payment)
-        self.edit_btn = QPushButton("Edit Job")
-        self.edit_btn.clicked.connect(self._on_edit_job)
-        self.cancel_btn = QPushButton("Cancel Job")
-        self.cancel_btn.setObjectName("DangerButton")
-        self.cancel_btn.clicked.connect(self._on_cancel_job)
-        for b in (self.edit_btn, self.cancel_btn, self.payment_btn):
-            actions_row.addWidget(b)
+        # Action bar
+        actions = QHBoxLayout()
+        actions.setSpacing(8)
+        self._view_btn = QPushButton("View / payments")
+        self._view_btn.clicked.connect(self._on_view)
+        self._pay_btn = QPushButton("Add payment")
+        self._pay_btn.setObjectName("PrimaryButton")
+        self._pay_btn.clicked.connect(self._on_payment)
+        self._edit_btn = QPushButton("Edit")
+        self._edit_btn.clicked.connect(self._on_edit)
 
-        root.addWidget(self.table, 1)
-        root.addLayout(actions_row)
+        self._status_btn = QComboBox()
+        self._status_btn.setEnabled(False)
+        self._status_btn.addItems(("Set status...",) + JOB_STATUSES)
+        self._status_btn.currentTextChanged.connect(self._on_status_change)
 
-    def refresh(self):
-        with session_scope() as session:
-            svc = LabellingService(session)
-            search = self.search_input.text().strip()
-            status = self.status_combo.currentText()
-            jobs = svc.list_jobs(status=status, search=search, limit=300)
-            self._populate_table(jobs)
+        self._delete_btn = QPushButton("Delete")
+        self._delete_btn.setObjectName("DangerButton")
+        self._delete_btn.clicked.connect(self._on_delete)
 
-            pending = sum(1 for j in jobs if j.status == JobStatus.PENDING.value)
-            inprog = sum(1 for j in jobs if j.status == JobStatus.IN_PROGRESS.value)
-            self.card_pending.set_value(str(pending))
-            self.card_inprogress.set_value(str(inprog))
-            self.card_outstanding.set_value(format_money(svc.outstanding_total()))
-            self.card_today_pay.set_value(format_money(svc.today_payments_total()))
+        actions.addStretch(1)
+        for b in (self._view_btn, self._pay_btn, self._edit_btn, self._status_btn, self._delete_btn):
+            actions.addWidget(b)
+        panel.add_layout(actions)
 
-    def _populate_table(self, jobs):
-        self.table.setRowCount(0)
-        for j in jobs:
-            row = self.table.rowCount()
-            self.table.insertRow(row)
-            cells = [
-                format_datetime(j.created_at),
-                j.customer_name,
-                j.product_description[:60] + ("..." if len(j.product_description) > 60 else ""),
-                str(j.quantity),
-                format_money(j.total_amount),
-                format_money(j.paid_amount),
-                format_money(j.balance_amount),
-                j.status,
-            ]
-            for col, value in enumerate(cells):
-                item = QTableWidgetItem(str(value))
-                if col in (3, 4, 5, 6):
-                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                if col == 6 and j.balance_amount > 0:
-                    item.setForeground(QColor("#dc2626"))
-                if col == 7:
-                    if j.status == JobStatus.COMPLETED.value:
-                        item.setForeground(QColor("#16a34a"))
-                    elif j.status == JobStatus.CANCELLED.value:
-                        item.setForeground(QColor("#94a3b8"))
-                    elif j.status == JobStatus.IN_PROGRESS.value:
-                        item.setForeground(QColor("#d97706"))
-                item.setData(Qt.UserRole, j.id)
-                self.table.setItem(row, col, item)
-        set_column_widths(self.table, [140, 160, None, 70, 100, 100, 100, 110])
+        layout.addWidget(panel, stretch=1)
+        self._update_actions()
 
-    # ----- Actions -----
-    def _selected_job_id(self):
+    # ------------------------------------------------------------------
+
+    def refresh(self) -> None:
+        sel = self._status_combo.currentText()
+        kwargs: dict = dict(search=self._search_input.text().strip(), limit=1000)
+        if sel == "Has balance":
+            kwargs["only_with_balance"] = True
+        elif sel != "All":
+            kwargs["status"] = sel
+        try:
+            rows = labelling_service.list_jobs(**kwargs)
+        except Exception as exc:  # pragma: no cover
+            error(self, "Could not load jobs", str(exc))
+            return
+        self._rows = rows
+        self._populate_table(rows)
+        self._update_cards()
+        self._update_actions()
+
+    def _populate_table(self, rows: List[labelling_service.JobSummary]) -> None:
+        self.table.setRowCount(len(rows))
+        for r, row in enumerate(rows):
+            self.table.setItem(r, 0, make_item(format_date(row.created_at), data=row.id))
+            self.table.setItem(r, 1, make_item(
+                f"{row.customer_name}" + (f"  ({row.customer_phone})" if row.customer_phone else "")
+            ))
+            self.table.setItem(r, 2, make_item(row.item_type + (f" - {row.description}" if row.description else "")))
+            self.table.setItem(r, 3, make_item(str(row.quantity), align=Qt.AlignRight | Qt.AlignVCenter))
+            self.table.setItem(r, 4, make_money_item(row.total_amount, bold=True))
+            self.table.setItem(r, 5, make_money_item(row.amount_paid))
+            self.table.setItem(r, 6, make_money_item(
+                row.balance, bold=row.balance > 0,
+            ))
+
+            pay_badge = StatusBadge(row.payment_status, PAYMENT_STATE_MAP.get(row.payment_status, "muted"))
+            job_badge = StatusBadge(row.job_status, JOB_STATE_MAP.get(row.job_status, "muted"))
+            self.table.setCellWidget(r, 7, _wrap(pay_badge))
+            self.table.setCellWidget(r, 8, _wrap(job_badge))
+
+            self.table.setItem(r, 9, make_item(format_date(row.due_date) if row.due_date else "-"))
+
+    def _update_cards(self) -> None:
+        try:
+            counts = labelling_service.status_counts()
+            self._card_pending.set_value(str(counts.get(JOB_STATUS_PENDING, 0)))
+            self._card_progress.set_value(str(counts.get(JOB_STATUS_IN_PROGRESS, 0)))
+            self._card_outstanding.set_money(labelling_service.outstanding_balance())
+            self._card_today_pay.set_money(labelling_service.today_revenue())
+        except Exception as exc:  # pragma: no cover
+            print(f"[v0] labelling cards refresh failed: {exc}")
+
+    # ------------------------------------------------------------------
+
+    def _selected(self) -> Optional[labelling_service.JobSummary]:
         row = self.table.currentRow()
         if row < 0:
             return None
         item = self.table.item(row, 0)
-        return item.data(Qt.UserRole) if item else None
+        if item is None:
+            return None
+        rid = item.data(Qt.UserRole)
+        for r in self._rows:
+            if r.id == rid:
+                return r
+        return None
 
-    def _on_new_job(self):
-        if not has_permission("labelling.create"):
-            QMessageBox.warning(self, "Access denied", "You cannot create jobs.")
-            return
+    def _update_actions(self) -> None:
+        sel = self._selected()
+        has = sel is not None
+        self._view_btn.setEnabled(has)
+        self._edit_btn.setEnabled(has and sel.job_status != JOB_STATUS_CANCELLED)
+        self._pay_btn.setEnabled(
+            has and sel.balance > 0 and sel.job_status != JOB_STATUS_CANCELLED
+        )
+        self._status_btn.setEnabled(has)
+        cu = current_user()
+        self._delete_btn.setEnabled(has and cu is not None and cu.role == ROLE_ADMIN)
+        # Reset combo without triggering refresh
+        self._status_btn.blockSignals(True)
+        self._status_btn.setCurrentIndex(0)
+        self._status_btn.blockSignals(False)
+
+    def _on_add(self) -> None:
         dlg = JobDialog(self)
-        if not dlg.exec():
-            return
-        data = dlg.get_data()
-        try:
-            with session_scope() as session:
-                LabellingService(session).create_job(
-                    customer_name=data["customer_name"],
-                    product_description=data["product_description"],
-                    total_amount=data["total_amount"],
-                    quantity=data["quantity"],
-                    notes=data["notes"],
-                    deposit=data["deposit"],
-                    deposit_method=data["deposit_method"],
-                )
+        if dlg.exec() == QDialog.Accepted:
+            toast(self, "Labelling job saved", "success")
             self.refresh()
-        except (LabellingError, AuthError) as e:
-            QMessageBox.warning(self, "Cannot create job", str(e))
 
-    def _on_edit_job(self):
-        job_id = self._selected_job_id()
-        if not job_id:
-            QMessageBox.information(self, "Select job", "Please select a job first.")
+    def _on_edit(self) -> None:
+        sel = self._selected()
+        if sel is None:
             return
-        with session_scope() as session:
-            job = LabellingService(session).get_job(job_id)
-            if not job:
-                return
-            session.expunge(job)
-        dlg = JobDialog(self, job=job)
-        if not dlg.exec():
-            return
-        data = dlg.get_data()
-        try:
-            with session_scope() as session:
-                LabellingService(session).update_job(
-                    job_id,
-                    customer_name=data["customer_name"],
-                    product_description=data["product_description"],
-                    total_amount=data["total_amount"],
-                    quantity=data["quantity"],
-                    notes=data["notes"],
-                )
+        dlg = JobDialog(self, job=sel)
+        if dlg.exec() == QDialog.Accepted:
+            toast(self, "Job updated", "success")
             self.refresh()
-        except (LabellingError, AuthError) as e:
-            QMessageBox.warning(self, "Cannot update job", str(e))
 
-    def _on_add_payment(self):
-        job_id = self._selected_job_id()
-        if not job_id:
-            QMessageBox.information(self, "Select job", "Please select a job first.")
+    def _on_payment(self) -> None:
+        sel = self._selected()
+        if sel is None:
             return
-        with session_scope() as session:
-            job = LabellingService(session).get_job(job_id)
-            if not job:
-                return
-            if job.status == JobStatus.COMPLETED.value:
-                QMessageBox.information(self, "Fully paid", "This job is already fully paid.")
-                return
-            if job.status == JobStatus.CANCELLED.value:
-                QMessageBox.warning(self, "Cancelled", "Cannot pay a cancelled job.")
-                return
-            session.expunge(job)
-        dlg = PaymentDialog(self, job=job)
-        if not dlg.exec():
+        if sel.balance <= 0:
+            info(self, "Fully paid", "This job has been fully paid already.")
             return
-        data = dlg.get_data()
-        try:
-            with session_scope() as session:
-                LabellingService(session).add_payment(
-                    job_id,
-                    amount=data["amount"],
-                    method=data["method"],
-                    notes=data["notes"],
-                )
+        dlg = PaymentDialog(self, sel)
+        if dlg.exec() == QDialog.Accepted:
+            toast(self, "Payment recorded", "success")
             self.refresh()
-        except (LabellingError, AuthError) as e:
-            QMessageBox.warning(self, "Cannot record payment", str(e))
 
-    def _on_cancel_job(self):
-        if not has_permission("labelling.cancel"):
-            QMessageBox.warning(self, "Access denied", "Only managers/admins can cancel jobs.")
+    def _on_status_change(self, text: str) -> None:
+        if text in (None, "", "Set status..."):
             return
-        job_id = self._selected_job_id()
-        if not job_id:
-            QMessageBox.information(self, "Select job", "Please select a job first.")
+        sel = self._selected()
+        if sel is None:
             return
-        if not ConfirmDialog.ask(
-            self, "Cancel Job",
-            "Are you sure you want to cancel this job? Payments already received are kept on record."
+        try:
+            labelling_service.set_job_status(sel.id, text)
+        except labelling_service.LabellingError as exc:
+            error(self, "Could not update status", str(exc))
+            return
+        log_action(
+            AUDIT_UPDATE,
+            module="labelling",
+            description=f"Set job #{sel.id} status to '{text}' ({sel.customer_name})",
+        )
+        toast(self, f"Status: {text}", "info")
+        self.refresh()
+
+    def _on_view(self) -> None:
+        sel = self._selected()
+        if sel is None:
+            return
+        try:
+            payments = labelling_service.list_payments(sel.id)
+        except Exception as exc:  # pragma: no cover
+            error(self, "Could not load job", str(exc))
+            return
+
+        lines = [
+            f"Customer: {sel.customer_name}",
+            f"Phone: {sel.customer_phone or '-'}",
+            f"Item: {sel.quantity}\u00d7 {sel.item_type}"
+            + (f" - {sel.description}" if sel.description else ""),
+            f"Created: {format_datetime(sel.created_at)}",
+            f"Due: {format_date(sel.due_date) if sel.due_date else '-'}",
+            f"Status: {sel.job_status}  /  {sel.payment_status}",
+            "",
+            f"Total: {format_money(sel.total_amount)}",
+            f"Paid:  {format_money(sel.amount_paid)}",
+            f"Bal:   {format_money(sel.balance)}",
+            "",
+            "Payments:",
+        ]
+        if not payments:
+            lines.append("  (no payments yet)")
+        else:
+            for p in payments:
+                lines.append(
+                    f"  - {format_datetime(p.paid_on)}  {format_money(p.amount)}  ({p.payment_method})"
+                    + (f"  - {p.notes}" if p.notes else "")
+                )
+        if sel.notes:
+            lines.append("")
+            lines.append(f"Notes: {sel.notes}")
+
+        info(self, f"Job #{sel.id}", "\n".join(lines))
+
+    def _on_delete(self) -> None:
+        sel = self._selected()
+        if sel is None:
+            return
+        if not confirm(
+            self,
+            "Delete job",
+            (
+                f"Delete labelling job for '{sel.customer_name}'? "
+                "All recorded payments will also be removed from sales reports."
+            ),
+            destructive=True,
         ):
             return
         try:
-            with session_scope() as session:
-                LabellingService(session).cancel_job(job_id, reason="Cancelled by user")
-            self.refresh()
-        except (LabellingError, AuthError) as e:
-            QMessageBox.warning(self, "Cannot cancel job", str(e))
-
-    def _on_view_job(self, row, _col):
-        item = self.table.item(row, 0)
-        if not item:
+            labelling_service.delete_job(sel.id)
+        except labelling_service.LabellingError as exc:
+            error(self, "Could not delete", str(exc))
             return
-        job_id = item.data(Qt.UserRole)
-        with session_scope() as session:
-            job = LabellingService(session).get_job(job_id)
-            if not job:
-                return
-            lines = [
-                f"Customer: {job.customer_name}",
-                f"Product: {job.product_description}",
-                f"Quantity: {job.quantity}",
-                f"Total: {format_money(job.total_amount)}",
-                f"Paid: {format_money(job.paid_amount)}",
-                f"Balance: {format_money(job.balance_amount)}",
-                f"Status: {job.status}",
-                "",
-                "Payment History:",
-            ]
-            if not job.payments:
-                lines.append("  (no payments yet)")
-            else:
-                for p in sorted(job.payments, key=lambda x: x.created_at):
-                    lines.append(
-                        f"  - {format_datetime(p.created_at)} : "
-                        f"{format_money(p.amount)} ({p.payment_method})"
-                        + (f" - {p.notes}" if p.notes else "")
-                    )
-            QMessageBox.information(self, f"Job #{job.id}", "\n".join(lines))
+        log_action(
+            AUDIT_DELETE,
+            module="labelling",
+            description=f"Deleted labelling job #{sel.id} ({sel.customer_name})",
+        )
+        toast(self, "Job deleted", "info")
+        self.refresh()
+
+
+def _wrap(widget: QWidget) -> QWidget:
+    w = QWidget()
+    row = QHBoxLayout(w)
+    row.setContentsMargins(6, 0, 6, 0)
+    row.addWidget(widget)
+    row.addStretch(1)
+    return w
